@@ -179,10 +179,15 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
 
     momentum_t is a 0-D CPU tensor to avoid triggering graph recompilations when the value changes.
     """
-    # Nesterov momentum (in FP32)
-    momentum = momentum_t.to(grad_chunk.dtype)
-    momentum_buffer.lerp_(grad_chunk, 1 - momentum)
-    g = grad_chunk.lerp_(momentum_buffer, momentum)
+    # AdaMuon Adam math (in FP32)
+    beta1 = momentum_t.to(grad_chunk.dtype)
+    beta2 = beta2_t.to(grad_chunk.dtype)
+
+    momentum_buffer.lerp_(grad_chunk, 1 - beta1)
+    # Memory efficient variance tracking (avoids allocating grad_sqs)
+    second_momentum_buffer.mul_(beta2).addcmul_(grad_chunk, grad_chunk, value=1 - beta2)
+
+    g = momentum_buffer.div(second_momentum_buffer.sqrt().add_(1e-30))
 
     X = g.bfloat16()
     is_tall = g.size(-2) > g.size(-1)
@@ -244,6 +249,8 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momen
                 aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
 
             X, C = C, X  # Swap references to avoid unnecessary copies
+
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-30)
 
     return X
 
@@ -454,6 +461,7 @@ class NorMuonAndAdam:
         self._eff_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._eff_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
         # Track async operations
         self._reduce_futures: dict[nn.Parameter, tuple] = {}
@@ -551,23 +559,13 @@ class NorMuonAndAdam:
                 chunk_shape = (p_cfg.chunk_size, *p_cfg.reshape[1:])
 
                 # Momentum buffer (FP32 for precision)
-                momentum_buffer = torch.zeros(
-                    chunk_shape, dtype=torch.float32, device=param.device
-                )
+                momentum_buffer = torch.zeros(chunk_shape, dtype=torch.float32, device=param.device)
 
-                # Second momentum buffer - reduced along one dimension
-                if chunk_shape[-2] >= chunk_shape[-1]:
-                    second_mom_shape = (*chunk_shape[:-1], 1)
-                else:
-                    second_mom_shape = (*chunk_shape[:-2], 1, chunk_shape[-1])
-                second_momentum_buffer = torch.zeros(
-                    second_mom_shape, dtype=torch.float32, device=param.device
-                )
+                # AdaMuon requires full-shape variance tracking
+                second_momentum_buffer = torch.zeros(chunk_shape, dtype=torch.float32, device=param.device)
 
                 # Mantissa buffer for precision tracking
-                mantissa = torch.zeros(
-                    chunk_shape, dtype=torch.uint16, device=param.device
-                )
+                mantissa = torch.zeros(chunk_shape, dtype=torch.uint16, device=param.device)
 
                 self.param_states[param] = dict(
                     momentum_buffer=momentum_buffer,
@@ -867,20 +865,16 @@ class NorMuonAndAdam:
         grad_chunk = grad_chunk.float()  # FP32 for momentum
 
         self._momentum_t.fill_(p_cfg.momentum)
+        self._beta2_t.fill_(p_cfg.beta2) # <-- Fill beta2
         self._eff_lr_t.fill_(p_cfg.lr_mul * p_cfg.lr)
         self._eff_wd_t.fill_(p_cfg.wd_mul * p_cfg.weight_decay * p_cfg.lr)
 
         # Fused Nesterov momentum + Polar Express orthogonalization
         is_large_matrix = chunk_shape[-2] > 1024
         v_chunk = polar_express(
-            grad_chunk, p_state["momentum_buffer"], self._momentum_t,
+            grad_chunk, p_state["momentum_buffer"], p_state["second_momentum_buffer"], 
+            self._momentum_t, self._beta2_t,
             split_baddbmm=is_large_matrix,
-        )
-
-        # Variance reduction
-        red_dim = -1 if chunk_shape[-2] >= chunk_shape[-1] else -2
-        v_chunk = NorMuonAndAdam._apply_normuon_variance_reduction(
-            v_chunk, p_state["second_momentum_buffer"], p_cfg.beta2, red_dim
         )
 
         # Update parameter, in place, with cautious weight decay
@@ -1689,16 +1683,17 @@ training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterati
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
     # cooldown phase: linearly decrease momentum from max to min
-    momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
-    if step < muon_warmup_steps:
-        frac = step / muon_warmup_steps
-        momentum = momentum_min + frac * (momentum_max - momentum_min)
-    elif step > momentum_cd_start:
-        frac = (step - momentum_cd_start) / muon_cooldown_steps
-        momentum = momentum_max - frac * (momentum_max - momentum_min)
-    else:
-        momentum = momentum_max
-    return momentum
+    # momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
+    # if step < muon_warmup_steps:
+    #     frac = step / muon_warmup_steps
+    #     momentum = momentum_min + frac * (momentum_max - momentum_min)
+    # elif step > momentum_cd_start:
+    #     frac = (step - momentum_cd_start) / muon_cooldown_steps
+    #     momentum = momentum_max - frac * (momentum_max - momentum_min)
+    # else:
+    #     momentum = momentum_max
+    # return momentum
+    return 0.65
 
 class TrainingManager():
     """
@@ -1751,10 +1746,10 @@ class TrainingManager():
         )
 
         normuon_defaults = dict(
-            lr=0.023,
-            momentum=0.95,
+            lr=0.001,
+            momentum=0.65,
             beta2=0.95,
-            weight_decay=1.2,
+            weight_decay=0.0,
         )
 
         self.optimizer = NorMuonAndAdam(
