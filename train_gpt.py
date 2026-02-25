@@ -1683,16 +1683,17 @@ training_schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterati
 def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
     # warmup phase: linearly increase momentum from min to max
     # cooldown phase: linearly decrease momentum from max to min
-    momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
-    if step < muon_warmup_steps:
-        frac = step / muon_warmup_steps
-        momentum = momentum_min + frac * (momentum_max - momentum_min)
-    elif step > momentum_cd_start:
-        frac = (step - momentum_cd_start) / muon_cooldown_steps
-        momentum = momentum_max - frac * (momentum_max - momentum_min)
-    else:
-        momentum = momentum_max
-    return momentum
+    # momentum_cd_start = training_schedule.total_steps - muon_cooldown_steps
+    # if step < muon_warmup_steps:
+    #     frac = step / muon_warmup_steps
+    #     momentum = momentum_min + frac * (momentum_max - momentum_min)
+    # elif step > momentum_cd_start:
+    #     frac = (step - momentum_cd_start) / muon_cooldown_steps
+    #     momentum = momentum_max - frac * (momentum_max - momentum_min)
+    # else:
+    #     momentum = momentum_max
+    # return momentum
+    return 0.65
 
 class TrainingManager():
     """
@@ -1745,10 +1746,10 @@ class TrainingManager():
         )
 
         normuon_defaults = dict(
-            lr=0.023,
-            momentum=0.95,
+            lr=0.001,
+            momentum=0.65,
             beta2=0.95,
-            weight_decay=1.2,
+            weight_decay=0.0,
         )
 
         self.optimizer = NorMuonAndAdam(
