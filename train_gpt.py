@@ -167,8 +167,8 @@ polar_express_coeffs = [
 ]
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
-def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, momentum_t: torch.Tensor,
-                  split_baddbmm: bool = False):
+def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, second_momentum_buffer: torch.Tensor,
+                  momentum_t: torch.Tensor, beta2_t: torch.Tensor, split_baddbmm: bool = False):
     """
     Fused Nesterov momentum + Polar Express Sign Method.
     Nesterov momentum is applied in FP32, then the result is cast to BF16 for polar express
