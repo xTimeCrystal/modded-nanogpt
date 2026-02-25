@@ -250,7 +250,7 @@ def polar_express(grad_chunk: torch.Tensor, momentum_buffer: torch.Tensor, secon
 
             X, C = C, X  # Swap references to avoid unnecessary copies
 
-    X = F.rms_norm(X, (X.size(-2), X.size(-1)), eps=EPS)
+    X = F.rms_norm(X, (X.size(-2), X.size(-1)), eps=1e-30)
                       
     return X
 
